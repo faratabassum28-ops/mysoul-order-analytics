@@ -1,0 +1,26 @@
+{
+  "name": "mysoul-order-analytics-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node scripts/seed-users.js",
+    "test": "node --test test/core.test.js test/shopify.test.js test/shopifyAuth.test.js test/shipway.test.js test/flow.test.js test/flowService.test.js test/desk.test.js test/funnel.test.js test/unified.test.js test/dispatch.test.js test/manifest.test.js test/assign.test.js test/analysis.test.js test/teamPerf.test.js test/cases.test.js test/staffView.test.js test/roles.test.js",
+    "demo": "node scripts/demo.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.19.2",
+    "google-auth-library": "^9.14.0",
+    "mongoose": "^8.5.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}

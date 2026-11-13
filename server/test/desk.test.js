@@ -1,0 +1,225 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('crypto');
+const D = require('../src/lib/desk');
+const { verifyShopifyHmac } = require('../src/lib/shopifyHmac');
+
+const H = D.HOUR; const DAY = D.DAY;
+const conf = D.normaliseConfig({}, { ...D.DEFAULT_CONFIG, startFrom: '2026-10-01' }); // FU hours 0/2/4, pending hours 24/24/24
+const who = { id: 'u1', name: 'Asha' };
+const t0 = new Date('2026-10-16T06:00:00Z');
+const order = { orderId: 1500, createdAt: t0 };
+const apply = (doc, t) => ({ ...doc, ...t.set, log: [...doc.log, ...t.entries] });
+const step = (doc, action, input, now, o = { total: 1000 }) => apply(doc, D.transition(doc, action, input, conf, who, o, now));
+
+test('a new order enters the confirm queue at FU1, due straight away by default', () => {
+  const s = D.initialState(order, conf, t0);
+  assert.equal(s.stage, 'confirm'); assert.equal(s.fuNo, 1);
+  assert.equal(s.dueAt.getTime(), t0.getTime());
+  assert.equal(D.fuLabel(s), 'FU1');
+});
+
+test('FU1 timing comes from settings (hours after the order)', () => {
+  const c = D.normaliseConfig({ confirmHours: [0.5, 3, 6] }, conf);
+  assert.equal(D.initialState(order, c, t0).dueAt.getTime(), t0.getTime() + 30 * 60000);
+});
+
+test('an order cancelled in Shopify goes straight to Cancelled with the reason', () => {
+  const s = D.initialState({ ...order, cancelledAt: t0 }, conf, t0);
+  assert.equal(s.stage, 'cancelled'); assert.equal(s.cancel.reason, 'Cancelled in Shopify'); assert.equal(s.cancel.auto, true);
+});
+
+test('DNP needs the WhatsApp yes/no answer', () => {
+  const s = D.initialState(order, conf, t0);
+  assert.throws(() => D.transition(s, 'dnp', {}, conf, who, {}, t0), /WhatsApp message was shared/);
+  assert.throws(() => D.transition(s, 'dnp', { whatsappShared: 'maybe' }, conf, who, {}, t0), /WhatsApp/);
+});
+
+test('FU1 DNP -> FU2 due after the configured gap; FU2 DNP -> FU3; FU3 DNP -> Pending Day 1', () => {
+  let d = D.initialState(order, conf, t0);
+  d = step(d, 'dnp', { whatsappShared: 'yes' }, t0);
+  assert.equal(d.fuNo, 2); assert.equal(d.stage, 'confirm');
+  assert.equal(d.dueAt.getTime(), t0.getTime() + 2 * H);
+  assert.equal(d.log.at(-1).whatsappShared, true);
+  const t1 = new Date(t0.getTime() + 2 * H);
+  d = step(d, 'dnp', { whatsappShared: 'no' }, t1);
+  assert.equal(d.fuNo, 3); assert.equal(d.dueAt.getTime(), t1.getTime() + 4 * H);
+  const t2 = new Date(t1.getTime() + 4 * H);
+  d = step(d, 'dnp', { whatsappShared: true }, t2);
+  assert.equal(d.stage, 'pending'); assert.equal(d.fuNo, 1); assert.equal(d.dnpCount, 3);
+  assert.equal(d.dueAt.getTime(), t2.getTime() + DAY);
+  assert.equal(d.log.at(-1).action, 'to_pending');
+});
+
+test('DNP before the follow-up is due is refused', () => {
+  let d = D.initialState(order, conf, t0);
+  d = step(d, 'dnp', { whatsappShared: 'yes' }, t0);
+  assert.throws(() => D.transition(d, 'dnp', { whatsappShared: 'yes' }, conf, who, {}, new Date(t0.getTime() + H)), /not due yet/);
+});
+
+test('Pending follow-ups are in hours and, like the confirm queue, each one is counted from the previous no-answer; the last DNP auto-cancels', () => {
+  const c = D.normaliseConfig({ pendingHours: [48, 24, 12] }, conf); // gaps, not a running total
+  const go = (doc, now) => apply(doc, D.transition(doc, 'dnp', { whatsappShared: 'yes' }, c, who, {}, now));
+  let d = { ...D.initialState(order, c, t0), stage: 'confirm', fuNo: 3, dueAt: t0, dnpCount: 2 };
+  d = go(d, t0); // FU3 DNP -> Pending, Day 1 due 48 h later
+  assert.equal(d.stage, 'pending'); assert.equal(d.fuNo, 1); assert.equal(d.dueAt.getTime(), t0.getTime() + 48 * H);
+  const day1 = new Date(t0.getTime() + 53 * H); // answered 5 h late: the next gap starts from the answer
+  d = go(d, day1);
+  assert.equal(d.fuNo, 2); assert.equal(d.dueAt.getTime(), day1.getTime() + 24 * H);
+  const day2 = new Date(day1.getTime() + 24 * H);
+  d = go(d, day2);
+  assert.equal(d.fuNo, 3); assert.equal(d.dueAt.getTime(), day2.getTime() + 12 * H);
+  d = go(d, new Date(day2.getTime() + 12 * H));
+  assert.equal(d.stage, 'cancelled'); assert.equal(d.cancel.auto, true); assert.equal(d.dnpCount, 6);
+  assert.match(d.cancel.reason, /6 follow-ups/);
+  assert.equal(d.log.at(-1).action, 'auto_cancel');
+});
+
+test('settings saved with the old day numbers keep their timing when read as hours', () => {
+  assert.deepEqual(D.normaliseConfig({}, { startFrom: '2026-10-01', pendingDays: [1, 2, 3] }).pendingHours, [24, 24, 24]);
+  assert.deepEqual(D.normaliseConfig({}, { startFrom: '2026-10-01', pendingDays: [2, 3, 7] }).pendingHours, [48, 24, 96]);
+  assert.equal(D.normaliseConfig({}, { startFrom: '2026-10-01', pendingDays: [1, 2, 3] }).pendingDays, undefined);
+  assert.deepEqual(D.DEFAULT_CONFIG.pendingHours, [24, 24, 24]);
+});
+
+test('renamed follow-ups show in the plain-language history, while the stored name stays fixed for the Overview', () => {
+  const c = D.normaliseConfig({ labels: { fu1: 'Call 1', fu2: 'Call 2', day1: 'Pending 1' } }, conf);
+  let d = D.initialState(order, c, t0);
+  assert.match(d.log[0].label, /Call 1/);
+  d = apply(d, D.transition(d, 'dnp', { whatsappShared: 'yes' }, c, who, {}, t0));
+  assert.match(d.log.at(-1).label, /^Call 1: did not pick up/); assert.equal(d.log.at(-1).fu, 'FU1');
+  assert.equal(D.statusLabel(d, c.labels), 'Confirm queue · Call 2');
+  assert.equal(D.statusLabel(d), 'Confirm queue · FU2'); // no names given: the defaults
+});
+
+test('names can be changed, reset by leaving them empty, and only known names are accepted', () => {
+  const c = D.normaliseConfig({ labels: { tabConfirm: '  Calls  ', btnDone: 'Next' } }, conf);
+  assert.deepEqual(c.labels, { tabConfirm: 'Calls', btnDone: 'Next' });
+  assert.deepEqual(D.normaliseConfig({ labels: { tabConfirm: '', btnDone: 'DONE' } }, c).labels, {}); // empty or equal to the default = back to default
+  assert.throws(() => D.normaliseConfig({ labels: { tabNope: 'x' } }, conf), /Unknown name/);
+  assert.throws(() => D.normaliseConfig({ labels: { fu1: 'x'.repeat(200) } }, conf), /under 90/);
+  assert.equal(D.labelOf({ fu1: 'Call 1' }, 'fu1'), 'Call 1'); assert.equal(D.labelOf({}, 'fu1'), 'FU1');
+});
+
+test('Confirmed moves to the dispatch queue and remembers which follow-up got it', () => {
+  let d = D.initialState(order, conf, t0);
+  d = step(d, 'dnp', { whatsappShared: 'yes' }, t0);
+  d = step(d, 'confirm', {}, new Date(t0.getTime() + 3 * H));
+  assert.equal(d.stage, 'dispatch'); assert.equal(d.confirmedAtFu, 'FU2'); assert.equal(d.dueAt, null);
+});
+
+test('Cancelled needs a reason and keeps it with who cancelled', () => {
+  const d = D.initialState(order, conf, t0);
+  assert.throws(() => D.transition(d, 'cancel', { reason: ' ' }, conf, who, {}, t0), /reason/);
+  const c = step(d, 'cancel', { reason: 'Price / COD charges', note: 'wants prepaid discount' }, t0);
+  assert.equal(c.stage, 'cancelled'); assert.equal(c.cancel.reason, 'Price / COD charges'); assert.equal(c.cancel.byName, 'Asha'); assert.equal(c.cancel.auto, false);
+});
+
+test('Partial paid: amount below the total, screenshot required by default, balance worked out', () => {
+  const d = D.initialState(order, conf, t0);
+  assert.throws(() => D.transition(d, 'partial_paid', { amount: 0 }, conf, who, { total: 1000 }, t0), /how much/);
+  assert.throws(() => D.transition(d, 'partial_paid', { amount: 1000, screenshotId: 's' }, conf, who, { total: 1000 }, t0), /Use Confirmed/);
+  assert.throws(() => D.transition(d, 'partial_paid', { amount: 300 }, conf, who, { total: 1000 }, t0), /screenshot/);
+  const p = step(d, 'partial_paid', { amount: 300, notes: 'UPI ref 123', screenshotId: 'shot1' }, t0);
+  assert.equal(p.stage, 'dispatch'); assert.equal(p.partial.amount, 300); assert.equal(p.partial.balance, 700); assert.equal(p.partial.screenshotId, 'shot1');
+  assert.equal(D.statusLabel(p), 'Partial paid · to dispatch');
+  const off = D.normaliseConfig({ requireScreenshot: false }, conf);
+  const q = apply(d, D.transition(d, 'partial_paid', { amount: 300 }, off, who, { total: 1000 }, t0));
+  assert.equal(q.partial.screenshotId, null);
+});
+
+test('an unset partial object ({} from the database) does not count as partial', () => {
+  assert.equal(D.statusLabel({ stage: 'dispatch', partial: {} }), 'Confirmed · to dispatch');
+});
+
+test('dispatch, and the wrong-stage guard', () => {
+  let d = step(D.initialState(order, conf, t0), 'confirm', {}, t0);
+  assert.throws(() => D.transition(d, 'dnp', { whatsappShared: 'yes' }, conf, who, {}, t0), /already dispatch queue/i);
+  d = step(d, 'dispatch', { awb: ' AB123 ', courier: 'Delhivery' }, t0);
+  assert.equal(d.stage, 'dispatched'); assert.equal(d.dispatch.awb, 'AB123');
+  assert.throws(() => D.transition(d, 'confirm', {}, conf, who, {}, t0), /already/);
+});
+
+test('restore puts a cancelled order back at FU1', () => {
+  let d = step(D.initialState(order, conf, t0), 'cancel', { reason: 'Other' }, t0);
+  d = step(d, 'restore', {}, t0);
+  assert.equal(d.stage, 'confirm'); assert.equal(d.fuNo, 1); assert.equal(d.cancel, null);
+  assert.throws(() => D.transition(D.initialState(order, conf, t0), 'restore', {}, conf, who, {}, t0), /already/);
+});
+
+test('settings are validated', () => {
+  assert.throws(() => D.normaliseConfig({ confirmHours: [0, 2] }, conf), /three numbers/);
+  assert.throws(() => D.normaliseConfig({ confirmHours: [0, -1, 4] }, conf), /0 to 720/);
+  assert.throws(() => D.normaliseConfig({ pendingHours: [48, 24] }, conf), /three numbers/);
+  assert.throws(() => D.normaliseConfig({ pendingHours: [48, -1, 24] }, conf), /0 to 720/);
+  assert.deepEqual(D.normaliseConfig({ pendingHours: [48, 24, 24] }, conf).pendingHours, [48, 24, 24]); // not ascending: these are gaps
+  assert.throws(() => D.normaliseConfig({ cancelReasons: [] }, conf), /between 1 and 30/);
+  assert.throws(() => D.normaliseConfig({ startFrom: 'yesterday' }, conf), /2026-10-16/);
+  assert.deepEqual(D.normaliseConfig({ cancelReasons: ['A ', 'A', ' B'] }, conf).cancelReasons, ['A', 'B']);
+});
+
+test('phone numbers and the WhatsApp link', () => {
+  assert.equal(D.dialNumber('+91 98765-43210'), '+919876543210');
+  assert.equal(D.dialNumber('09876543210'), '+919876543210');
+  assert.equal(D.dialNumber('12345'), null);
+  const l = D.waLink('98765 43210', 'Hi & bye');
+  assert.equal(l, 'https://wa.me/919876543210?text=Hi%20%26%20bye');
+  assert.equal(D.waLink('', 'x'), null);
+  assert.equal(D.renderTemplate('Hi {name}, {order} ₹{amount} {nope}', { name: 'Asha', order: '#1500', amount: 999 }), 'Hi Asha, #1500 ₹999 {nope}');
+});
+
+test('collect amount: paid orders collect nothing, COD collects total minus partial', () => {
+  assert.equal(D.collectAmount(1000, 'PAID', null), 0);
+  assert.equal(D.collectAmount(1000, 'PENDING', null), 1000);
+  assert.equal(D.collectAmount(1000, 'PENDING', { amount: 300 }), 700);
+});
+
+test('overview numbers add up', () => {
+  const mk = (stage, total, extra = {}) => ({ total, desk: { stage, fuNo: 1, orderAt: t0, log: [], ...extra } });
+  let a = D.initialState({ orderId: 1, createdAt: t0 }, conf, t0);
+  a = step(a, 'dnp', { whatsappShared: 'yes' }, t0);
+  a = step(a, 'confirm', {}, new Date(t0.getTime() + 3 * H));
+  let b = D.initialState({ orderId: 2, createdAt: t0 }, conf, t0);
+  b = step(b, 'cancel', { reason: 'Price / COD charges' }, new Date(t0.getTime() + H));
+  const rows = [{ desk: a, total: 1000 }, { desk: b, total: 500 }, mk('pending', 300), { desk: null, total: 200 }];
+  const s = D.overviewStats(rows, new Date(t0.getTime() + 10 * H));
+  assert.equal(s.totalOrders, 4); assert.equal(s.stageCount.dispatch, 1); assert.equal(s.stageCount.cancelled, 1); assert.equal(s.stageCount.pending, 1); assert.equal(s.stageCount.none, 1);
+  assert.equal(s.money.all, 2000); assert.equal(s.money.confirmed, 1000); assert.equal(s.money.cancelled, 500);
+  assert.equal(s.confirmRate, 25); assert.equal(s.cancelRate, 25);
+  const fu1 = s.byFu.find((x) => x.fu === 'FU1'); const fu2 = s.byFu.find((x) => x.fu === 'FU2');
+  assert.equal(fu1.dnp, 1); assert.equal(fu1.whatsappYes, 1); assert.equal(fu1.cancelled, 1); assert.equal(fu2.confirmed, 1);
+  assert.equal(s.reasons[0].reason, 'Price / COD charges');
+  assert.equal(s.agents[0].name, 'Asha'); assert.equal(s.agents[0].calls, 3);
+  assert.equal(Math.round(s.avgDecisionHours * 10) / 10, 2); // (3h + 1h) / 2
+});
+
+test('Shopify webhook signature', () => {
+  const body = Buffer.from('{"id":1}'); const secret = 'shhh';
+  const good = crypto.createHmac('sha256', secret).update(body).digest('base64');
+  assert.equal(verifyShopifyHmac(body, good, secret), true);
+  assert.equal(verifyShopifyHmac(body, good, 'other'), false);
+  assert.equal(verifyShopifyHmac(Buffer.from('{"id":2}'), good, secret), false);
+  assert.equal(verifyShopifyHmac(body, '', secret), false);
+  assert.equal(verifyShopifyHmac(undefined, good, secret), false);
+  assert.equal(verifyShopifyHmac(body, good, ''), false);
+});
+
+test('the client keeps a copy of the default names for the moment before settings load; it must match the server list', () => {
+  const copy = require('../../client/src/labelDefaults.json');
+  assert.deepEqual(copy, D.DEFAULT_LABELS);
+});
+
+test('after 7 PM IST: a new order, a no-answer and a restore all open at 9 AM the next day', () => {
+  const { deferAfterHours } = require('../src/lib/afterHours');
+  const order8pm = { orderId: 1, createdAt: new Date('2026-10-18T14:30:00Z') }; // 8:00 PM IST
+  const nextMorning = new Date('2026-10-19T03:30:00Z').getTime(); // 9:00 AM IST
+  assert.equal(D.initialState(order8pm, { ...D.DEFAULT_CONFIG, confirmHours: [0, 2, 4] }, order8pm.createdAt).dueAt.getTime(), nextMorning);
+  const order2pm = { orderId: 2, createdAt: new Date('2026-10-18T08:30:00Z') };
+  assert.equal(D.initialState(order2pm, D.DEFAULT_CONFIG, order2pm.createdAt).dueAt.getTime(), order2pm.createdAt.getTime());
+  const six = new Date('2026-10-18T13:00:00Z'); // 6:30 PM IST, +2 h = 8:30 PM IST
+  const doc = { orderId: 3, stage: 'confirm', fuNo: 1, dueAt: six, log: [] };
+  const r = D.transition(doc, 'dnp', { whatsappShared: true }, { ...D.DEFAULT_CONFIG, confirmHours: [0, 2, 4] }, undefined, {}, six);
+  assert.equal(r.set.dueAt.getTime(), nextMorning);
+  assert.equal(deferAfterHours(new Date('2026-10-18T13:29:00Z')).getTime(), new Date('2026-10-18T13:29:00Z').getTime()); // 6:59 PM stays
+  assert.equal(deferAfterHours(new Date('2026-10-18T13:30:00Z')).getTime(), nextMorning); // 7:00 PM moves
+});

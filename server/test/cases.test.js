@@ -1,0 +1,165 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const C = require('../src/lib/cases');
+
+const who = { id: 'u1', name: 'Asha' };
+const t0 = new Date('2026-10-18T05:00:00Z');
+const open = (over = {}) => ({ orderId: 1500, status: 'open', step: 1, dueAt: t0, ...over });
+
+test('NDR: no answer moves FU1 -> FU2 -> FU3 with the set hours, then closes after FU3', () => {
+  const cfg = { ndrHours: [0, 4, 24] };
+  let c = open();
+  let r = C.ndrAction(c, 'dnp', 'phone off', who, cfg, t0);
+  assert.equal(r.set.step, 2); assert.equal(r.set.dueAt.getTime(), t0.getTime() + 4 * 3600e3);
+  assert.equal(r.entries[0].note, 'phone off'); assert.match(r.entries[0].label, /FU1: did not pick up · phone off/);
+  c = open({ step: 2, dueAt: r.set.dueAt });
+  r = C.ndrAction(c, 'dnp', '', who, cfg, new Date(t0.getTime() + 4 * 3600e3));
+  assert.equal(r.set.step, 3); assert.equal(r.set.dueAt.getTime(), t0.getTime() + 28 * 3600e3);
+  c = open({ step: 3, dueAt: r.set.dueAt });
+  r = C.ndrAction(c, 'dnp', '', who, cfg, new Date(t0.getTime() + 28 * 3600e3));
+  assert.equal(r.set.status, 'resolved'); assert.equal(r.set.resolution.outcome, 'no_response');
+});
+
+test('NDR: a call before it is due cannot be logged as no answer, but "wants" / "does not want" always can', () => {
+  const c = open({ step: 2, dueAt: new Date(t0.getTime() + 3600e3) });
+  assert.throws(() => C.ndrAction(c, 'dnp', '', who, undefined, t0), /FU2 is not due yet/);
+  assert.equal(C.ndrAction(c, 'wants', 'will be home Monday', who, undefined, t0).set.step, 2);
+  assert.equal(C.ndrAction(c, 'not_wants', '', who, undefined, t0).set.resolution.outcome, 'not_wants');
+});
+
+test('NDR: notes are kept, trimmed and capped; unknown outcomes and closed cases are refused', () => {
+  const r = C.ndrAction(open(), 'wants', `  ${'x'.repeat(900)}  `, who, undefined, t0);
+  assert.equal(r.entries[0].note.length, 500);
+  assert.throws(() => C.ndrAction(open(), 'maybe', '', who), /what the customer said/);
+  assert.throws(() => C.ndrAction(open({ status: 'resolved' }), 'wants', '', who), /already closed/);
+});
+
+test('NDR: customer still wants it -> the case goes to FU2 and stays open, from any step', () => {
+  const cfg = { ndrHours: [0, 4, 24] };
+  for (const step of [1, 2, 3]) {
+    const r = C.ndrAction(open({ step }), 'wants', 'call after 6pm', who, cfg, t0);
+    assert.equal(r.set.step, 2); assert.equal(r.set.status, undefined); assert.equal(r.set.resolution, undefined);
+    // from FU1 the next call is the following day at 9 AM IST; from FU2 / FU3 the usual FU2 gap applies
+    assert.equal(r.set.dueAt.getTime(), step === 1 ? new Date('2026-10-19T03:30:00Z').getTime() : t0.getTime() + 4 * 3600e3);
+    assert.equal(r.set.wants.count, 1); assert.equal(r.set.wants.note, 'call after 6pm');
+    assert.match(r.entries[0].label, /Added to FU2/);
+  }
+  assert.equal(C.ndrAction(open({ step: 2, wants: { count: 1 } }), 'wants', '', who, cfg, t0).set.wants.count, 2);
+});
+
+test('NDR: only Delivered or RTO closes a case; any other Shipway status leaves it open', () => {
+  for (const group of ['transit', 'other', 'cancelled', 'lost', 'reverse']) assert.equal(C.ndrAutoClose(open(), { group, status: 'Out for delivery' }), null);
+  assert.equal(C.ndrAutoClose(open(), { group: 'ndr', status: 'Undelivered' }), null);
+  assert.equal(C.ndrAutoClose(open(), { group: 'delivered', status: 'Delivered' }).set.resolution.outcome, 'delivered');
+  assert.equal(C.ndrAutoClose(open(), { group: 'rto', status: 'RTO in transit' }).set.resolution.outcome, 'rto');
+  assert.equal(C.ndrAutoClose(open({ status: 'resolved' }), { group: 'delivered' }), null);
+});
+
+test('weight: review -> submit on Shipway -> final resolution, each step can carry a note', () => {
+  let c = { orderId: 7, status: 'open', step: 1, weight: { extraCharge: 120 } };
+  let r = C.weightAction(c, { decision: 'dispute', note: 'box was 500 g' }, who, t0);
+  assert.equal(r.set.step, 2); assert.equal(r.entries[0].note, 'box was 500 g');
+  c = { ...c, step: 2 };
+  r = C.weightAction(c, { ref: 'TKT-77', note: 'photos attached' }, who, t0);
+  assert.equal(r.set.step, 3); assert.equal(r.set.requestRef, 'TKT-77');
+  c = { ...c, step: 3 };
+  assert.equal(C.weightAction(c, { decision: 'reversed' }, who, t0).set.resolution.amount, 120);
+  assert.equal(C.weightAction(c, { decision: 'rejected' }, who, t0).set.resolution.outcome, 'rejected');
+  assert.equal(C.weightAction(c, { decision: 'partial', amount: '60' }, who, t0).set.resolution.amount, 60);
+  assert.throws(() => C.weightAction(c, { decision: 'partial' }, who, t0), /amount Shipway credited/);
+  assert.throws(() => C.weightAction(c, {}, who, t0), /final result/);
+});
+
+test('weight: accepting the charge at review closes it; a closed case refuses more steps', () => {
+  const r = C.weightAction({ orderId: 7, status: 'open', step: 1 }, { decision: 'accept' }, who, t0);
+  assert.equal(r.set.resolution.outcome, 'accepted');
+  assert.throws(() => C.weightAction({ orderId: 7, status: 'resolved', step: 3 }, { decision: 'reversed' }, who), /already closed/);
+  assert.throws(() => C.weightAction({ orderId: 7, status: 'open', step: 1 }, {}, who), /correct, or raise/);
+});
+
+test('weight file: finds the columns by their usual names, converts kg to grams, works out the difference', () => {
+  const rows = [
+    { 'Order ID': '#1501', 'AWB Number': ' ab 123 ', 'Entered Weight': '0.5', 'Charged Weight': '1', 'Excess Charge': '₹ 85.00', Courier: 'Delhivery', Date: '15/10/2026' },
+    { 'Order ID': '', 'AWB Number': '', 'Entered Weight': '1', 'Charged Weight': '2' },
+    { 'Order ID': '1502', 'AWB Number': 'X9', 'Entered Weight': '500 g', 'Charged Weight': '1.2 kg', 'Excess Charge': '40' },
+  ];
+  const p = C.parseWeightRows(rows, { unit: 'kg' });
+  assert.equal(p.rows.length, 2); assert.equal(p.skipped.length, 1);
+  assert.deepEqual([p.rows[0].orderId, p.rows[0].awb, p.rows[0].declaredG, p.rows[0].chargedG, p.rows[0].diffG, p.rows[0].extraCharge], [1501, 'AB123', 500, 1000, 500, 85]);
+  assert.equal(p.rows[0].raisedAt.getTime(), new Date('2026-10-14T18:30:00Z').getTime()); // 15 Oct 2026, IST midnight
+  assert.deepEqual([p.rows[1].declaredG, p.rows[1].chargedG, p.rows[1].diffG], [500, 1200, 700]); // units written in the cell win
+  assert.equal(C.parseWeightRows([{ Foo: 1 }]).error, 'The file needs an Order ID column or an AWB column.');
+  assert.equal(C.parseWeightRows([{ 'Order No': 5, Weight: 1, 'Charged Weight': 700 }], { unit: 'g' }).rows[0].chargedG, 700);
+});
+
+test('RTO: starts when Shipway first showed an RTO status; received only counts when the team ticked it', () => {
+  const at = new Date('2026-10-10T00:00:00Z');
+  assert.equal(C.rtoSince({ history: [{ code: 'INT', at: new Date('2026-10-01') }, { code: 'RTO', at }], changedAt: new Date('2026-10-12') }).getTime(), at.getTime());
+  assert.equal(C.rtoSince({ history: [], changedAt: at }).getTime(), at.getTime());
+  assert.equal(C.rtoState({ statusCode: 'RTO' }, false), 'on_way');
+  assert.equal(C.rtoState({ statusCode: 'RTD' }, false), 'at_origin'); // Shipway says it is back, but nobody here confirmed it
+  assert.equal(C.rtoState({ statusCode: 'RTD' }, true), 'received');
+});
+
+test('RTO: total, new in the period, received and pending', () => {
+  const d = (s) => new Date(s);
+  const items = [
+    { since: d('2026-10-17'), state: 'on_way' }, { since: d('2026-10-18'), state: 'at_origin' },
+    { since: d('2026-10-05'), state: 'received' }, { since: d('2026-10-18'), state: 'received' },
+  ];
+  const s = C.rtoStats(items, { start: d('2026-10-17'), end: d('2026-10-19') });
+  assert.deepEqual([s.total, s.newInRange, s.received, s.pending, s.onWay, s.atOrigin], [4, 3, 2, 2, 1, 1]);
+  assert.equal(C.rtoStats(items, null).newInRange, 4);
+});
+
+test('case settings are validated', () => {
+  assert.deepEqual(C.normaliseCaseConfig({ ndrHours: [0, 2, 12] }).ndrHours, [0, 2, 12]);
+  assert.throws(() => C.normaliseCaseConfig({ ndrHours: [1, 2] }), /three numbers/);
+  assert.throws(() => C.normaliseCaseConfig({ ndrHours: [0, -1, 2] }), /follow-up 2/);
+});
+
+test('NDR: cases an old version closed as "Status changed" get the real result, or reopen', () => {
+  const moved = { orderId: 1446, status: 'resolved', step: 2, resolution: { outcome: 'moved', by: 'Shipway' } };
+  assert.equal(C.ndrReclassify(moved, { group: 'delivered', status: 'Delivered' }).set['resolution.outcome'], 'delivered');
+  assert.equal(C.ndrReclassify(moved, { group: 'rto', status: 'RTO in transit' }).set['resolution.outcome'], 'rto');
+  const r = C.ndrReclassify(moved, { group: 'transit', status: 'Out for delivery' }, { ndrHours: [0, 4, 24] }, t0);
+  assert.equal(r.set.status, 'open'); assert.equal(r.set.step, 2); assert.equal(r.set.dueAt.getTime(), t0.getTime() + 4 * 3600e3);
+  assert.equal(C.ndrReclassify(moved, { group: 'ndr', status: 'Undelivered' }), null); // a new NDR is handled by the normal sync
+  assert.equal(C.ndrReclassify({ ...moved, resolution: { outcome: 'wants' } }, { group: 'transit' }), null);
+});
+
+test('weight: Shipway order fields give a case only when charged weight is above declared', () => {
+  assert.deepEqual(C.weightFromShipment({ weight: 500, charged_weight: 1000, extra_charge: '₹60' }), { declaredG: 500, chargedG: 1000, diffG: 500, extraCharge: 60 });
+  assert.equal(C.weightFromShipment({ weight: 500, charged_weight: 500 }), null);
+  assert.equal(C.weightFromShipment({ weight: 500 }), null);
+  assert.equal(C.weightFromShipment({ weight: 0.5, charged_weight: 1 }, { unit: 'kg' }).diffG, 500);
+  assert.equal(C.weightFromShipment(null), null);
+});
+
+test('NDR: \"wants\" on FU1 is due the next day, also when marked late in the evening', () => {
+  const evening = new Date('2026-10-18T15:30:00Z'); // 9:00 PM IST on the 18th
+  const r = C.ndrAction(open(), 'wants', '', who, undefined, evening);
+  assert.equal(r.set.step, 2);
+  assert.equal(r.set.dueAt.getTime(), new Date('2026-10-19T03:30:00Z').getTime()); // 9:00 AM IST on the 19th
+  assert.match(r.entries[0].label, /Added to FU2 for the next day/);
+});
+
+test('NDR: no answer on FU1 prepares the WhatsApp draft; FU2 and FU3 do not', () => {
+  assert.equal(C.ndrAction(open(), 'dnp', '', who, undefined, t0).draft, true);
+  assert.match(C.ndrAction(open(), 'dnp', '', who, undefined, t0).entries[0].label, /WhatsApp draft prepared/);
+  assert.ok(!C.ndrAction(open({ step: 2, dueAt: t0 }), 'dnp', '', who, undefined, t0).draft);
+  assert.equal(C.ndrAction(open(), 'wants', '', who, undefined, t0).draft, undefined);
+  const text = C.renderNdrDraft(C.DEFAULT_NDR_TEMPLATE, { name: 'Asha', order: '#2476' });
+  assert.equal(text, 'Hello Dear, this is MySoulSchool. Our delivery partner tried to deliver your order #2476, but you were unavailable at the time of delivery. Kindly let us know a convenient time for delivery. Thank you!');
+});
+
+test('NDR: a follow-up that would fall due after 7 PM waits for 9 AM the next day', () => {
+  const cfg = { ndrHours: [0, 4, 24] };
+  const at4pm = new Date('2026-10-18T10:30:00Z'); // 4:00 PM IST; +4 h = 8:00 PM IST
+  const r = C.ndrAction(open(), 'dnp', '', who, cfg, at4pm);
+  assert.equal(r.set.dueAt.getTime(), new Date('2026-10-19T03:30:00Z').getTime());
+  const raisedAt8pm = new Date('2026-10-18T14:30:00Z'); // 8:00 PM IST
+  assert.equal(C.ndrFirstDue(raisedAt8pm, cfg).getTime(), new Date('2026-10-19T03:30:00Z').getTime());
+  const raisedAt2pm = new Date('2026-10-18T08:30:00Z');
+  assert.equal(C.ndrFirstDue(raisedAt2pm, cfg).getTime(), raisedAt2pm.getTime());
+});
